@@ -91,10 +91,15 @@ class StateManager(
     fun checkpoint(): List<AirbyteStateMessage> =
         listOfNotNull(global?.checkpoint()) + nonGlobal.mapNotNull { it.value.checkpoint() }
 
+    private data class SwapResult(
+        val opaqueStateValue: OpaqueStateValue?,
+        val numRecords: Long,
+        val isStale: Boolean,
+    )
+
     private sealed class BaseStateManager<K : Feed>(
         override val feed: K,
         initialState: OpaqueStateValue?,
-        private val isCheckpointUnique: Boolean = true,
     ) : StateManagerScopedToFeed {
         private var current: OpaqueStateValue?
         private var pending: OpaqueStateValue?
@@ -123,15 +128,13 @@ class StateManager(
             }
         }
 
-        fun swap(): Pair<OpaqueStateValue?, Long>? {
+        fun swap(): SwapResult {
             synchronized(this) {
-                if (isCheckpointUnique && !isPending) {
-                    return null
-                }
-                val returnValue: Pair<OpaqueStateValue?, Long> = pending to pendingNumRecords
+                val swapResult = SwapResult(pending, pendingNumRecords, !isPending)
                 current = pending
+                isPending = false
                 pendingNumRecords = 0L
-                return returnValue
+                return swapResult
             }
         }
     }
@@ -150,27 +153,28 @@ class StateManager(
             var numSwapped = 0
             var totalNumRecords: Long = 0L
             var globalStateValue: OpaqueStateValue? = current()
-            val globalSwapped: Pair<OpaqueStateValue?, Long>? = swap()
-            if (globalSwapped != null) {
+            val globalSwapped: SwapResult = swap()
+            if (!globalSwapped.isStale) {
                 numSwapped++
-                globalStateValue = globalSwapped.first
-                totalNumRecords += globalSwapped.second
+                globalStateValue = globalSwapped.opaqueStateValue
+                totalNumRecords += globalSwapped.numRecords
             }
             val streamStates = mutableListOf<AirbyteStreamState>()
             for ((_, streamStateManager) in streamStateManagers) {
-                var streamStateValue: OpaqueStateValue? = streamStateManager.current()
-                val globalStreamSwapped: Pair<OpaqueStateValue?, Long>? = streamStateManager.swap()
-                if (globalStreamSwapped != null) {
+                val streamSwapped: SwapResult = streamStateManager.swap()
+                if (!streamSwapped.isStale) {
                     numSwapped++
-                    streamStateValue = globalStreamSwapped.first
-                    totalNumRecords += globalStreamSwapped.second
                 }
+                totalNumRecords += streamSwapped.numRecords
                 val streamID: StreamIdentifier = streamStateManager.feed.id
                 streamStates.add(
                     AirbyteStreamState()
                         .withStreamDescriptor(streamID.asProtocolStreamDescriptor())
-                        .withStreamState(streamStateValue),
+                        .withStreamState(streamSwapped.opaqueStateValue),
                 )
+            }
+            if (numSwapped == 0) {
+                return null
             }
             val airbyteGlobalState =
                 AirbyteGlobalState()
@@ -186,22 +190,27 @@ class StateManager(
     private class GlobalStreamStateManager(
         stream: Stream,
         initialState: OpaqueStateValue?,
-    ) : BaseStateManager<Stream>(stream, initialState, isCheckpointUnique = false)
+    ) : BaseStateManager<Stream>(stream, initialState)
 
     private class NonGlobalStreamStateManager(
         stream: Stream,
         initialState: OpaqueStateValue?,
     ) : BaseStateManager<Stream>(stream, initialState) {
         fun checkpoint(): AirbyteStateMessage? {
-            val (opaqueStateValue: OpaqueStateValue?, numRecords: Long) = swap() ?: return null
+            val streamSwapped: SwapResult = swap()
+            if (streamSwapped.isStale) {
+                return null
+            }
             val airbyteStreamState =
                 AirbyteStreamState()
                     .withStreamDescriptor(feed.id.asProtocolStreamDescriptor())
-                    .withStreamState(opaqueStateValue)
+                    .withStreamState(streamSwapped.opaqueStateValue)
             return AirbyteStateMessage()
                 .withType(AirbyteStateMessage.AirbyteStateType.STREAM)
                 .withStream(airbyteStreamState)
-                .withSourceStats(AirbyteStateStats().withRecordCount(numRecords.toDouble()))
+                .withSourceStats(
+                    AirbyteStateStats().withRecordCount(streamSwapped.numRecords.toDouble())
+                )
         }
     }
 }
